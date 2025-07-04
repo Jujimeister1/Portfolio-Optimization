@@ -1,1 +1,315 @@
+---
+title: "Markowit'z Portfolio Theory Mean-Variance Optimization"
+author: "Eugene Jang"
+date: "2025-06-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Textbook-related library
+# library(FRAPO)
+
+# Install Rtools 4.4 
+# https://cran.rstudio.com/bin/windows/Rtools/rtools44/rtools.html
+# install.packages("quadprog", dependencies = TRUE)
+# install.packages(c("ROI.plugin.quadprog", "ROI.plugin.glpk"), dependencies = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(tidyquant)
+library(zoo)
+library(xts)
+library(PerformanceAnalytics)
+library(PortfolioAnalytics)
+library(quantmod)
+library(timetk)
+library(tibbletime)
+library(quadprog)
+library(ROI)
+library(TTR)
+```
+
+Example stock and price history
+
+```{r}
+apple_df <- getSymbols('AAPL', src='yahoo', auto.assign=FALSE)
+
+# Preview Price/Volume history (6 month period)
+chartSeries(apple_df, name="AAPL", subset="last 6 months", theme=chartTheme("white"))
+```
+Optimal Weights for example portfolio (Minimum Variance)
+
+```{r}
+# Create a base vector of ticker symbols
+symbols <- c("SPY", "AAPL", "JNJ", "JPM", "XOM", "MSFT")
+
+# Load data from 2015 to today
+# Specify the "to = " argument to specify an end date
+prices <- getSymbols(
+  Symbols = symbols,
+  src = "yahoo",
+  from = "2015-12-31",
+  auto.assign = TRUE,
+  warnings = FALSE
+) %>%
+  # The map function takes an anonymous function and will return a list of five
+  # The function Ad() extracts the daily adjusted price series
+  map(.f = ~ Ad(get(x = .x))) %>%
+  # Use reduce() to merge the elements of .x interactively
+  reduce(.f = merge) %>%
+  # Use a replacement function to set column names to ticker symbols
+  # This function is in prefix form
+  # It is equivalent to colnames(x = prices) <- value
+  `colnames<-`(value = symbols)
+```
+
+```{r}
+# Keep only the last reading of each month
+# We could have chosen to keep only the first reading of each month
+asset_returns_xts <- to.monthly(
+  x = prices,
+  drop.time = TRUE,
+  indexAt = "lastof",
+  OHLC = FALSE
+) |>
+  # Compute simple returns
+  # Log returns are time-additive but not portfolio additive
+  Return.calculate(method = "discrete") |>
+  # Drop the first row since we lose 12/31/2015
+  na.omit()
+# Keep only the xts returns, ticker symbols, and the prices series
+rm(list = setdiff(x = ls(), y = c("symbols", "prices", "asset_returns_xts")))
+```
+
+```{r}
+# Examine the monthly simple returns for our five ETF's
+head(x = asset_returns_xts, 5)
+```
+
+
+
+```{r}
+# Create Portfolio object which is essentially a list object
+min_var_portfolio <- portfolio.spec(assets = symbols)
+typeof(min_var_portfolio)
+```
+
+```{r}
+# Add the full investment constraint that specifies that the weights must sum to 1
+min_var_portfolio <- add.constraint(
+  portfolio = min_var_portfolio,
+  type = "full_investment"
+)
+# Examine the constraint element by extracting min_var_portfolio[["constraints"]][[1]]
+str(pluck(.x = min_var_portfolio, "constraints", 1))
+```
+
+```{r}
+# Add the box constraint that ensure the weights are between 0.1 and 0.6
+min_var_portfolio <- add.constraint(
+  portfolio = min_var_portfolio,
+  type = "box", min = 0.05, max = 0.6
+)
+# Examine the constraint element by extracting min_var_portfolio[["constraints"]][[2]]
+str(pluck(.x = min_var_portfolio, "constraints", 2))
+```
+
+```{r}
+# Add objective to minimize variance
+min_var_portfolio <- add.objective(
+  portfolio = min_var_portfolio,
+  # Minimize risk
+  type = "risk",
+  # A character corresponding to a function name, var()
+  name = "var"
+)
+```
+
+```{r}
+# Optimization
+global_min_portfolio <- optimize.portfolio(
+  R = asset_returns_xts,
+  portfolio = min_var_portfolio,
+  # This defaults to the "quadprog" solver
+  optimize_method = "quadprog",
+  # Return additional information on the path or portfolios searched
+  trace = TRUE
+)
+
+# Examine returned portfolio list object
+global_min_portfolio
+```
+
+Optimal Weights for example portfolio (Maximum Expected Return)
+
+```{r}
+# Create Portfolio object
+max_exp_return_portfolio <- portfolio.spec(assets = symbols)
+```
+
+```{r}
+# Add the full investment constraint that specifies the weights must sum to 1
+max_exp_return_portfolio <- add.constraint(
+  portfolio = max_exp_return_portfolio,
+  type = "full_investment"
+)
+# Add the box constraint that ensure the weights are between 0.1 and 0.6
+max_exp_return_portfolio <- add.constraint(
+  portfolio = max_exp_return_portfolio,
+  type = "box", min = 0.05, max = 0.6
+)
+```
+
+```{r}
+# Add objective to maximize mean returns
+max_exp_return_portfolio <- add.objective(
+  portfolio = max_exp_return_portfolio,
+  # Maximize expected returns
+  type = "return",
+  # A character corresponding to a function name, mean()
+  name = "mean"
+)
+```
+
+```{r}
+# Run the optimization
+global_max_portfolio <- optimize.portfolio(
+  R = asset_returns_xts,
+  portfolio = max_exp_return_portfolio,
+  # This defaults to the "glpk" solver
+  optimize_method = "ROI",
+  # Return additional information on the path or portfolios searched
+  trace = TRUE
+)
+# Examine returned portfolio list object
+global_max_portfolio
+```
+Monthly Portfolio Returns by xts 
+
+```{r}
+# Troubleshoot
+weights <- extractWeights(global_max_portfolio) # Named numeric vector match names of column names for global portfolio object
+names(weights) <- colnames(asset_returns_xts)
+length(weights) == ncol(asset_returns_xts)
+```
+
+```{r}
+# Compute monthly portfolio returns
+portfolio_returns_xts_rebalanced_monthly <-
+  Return.portfolio(
+    R = asset_returns_xts,
+    weights = weights,
+    # Monthly re-balancing
+    rebalance_on = "months",
+    # Use simple/arithmetic chaining to aggregate returns
+    geometric = FALSE
+  ) |>
+  `colnames<-`("Monthly_portfolio_returns")
+
+# Examine 
+head(portfolio_returns_xts_rebalanced_monthly, 5)
+```
+
+Build Portfolio
+
+```{r}
+# Set optimal weights
+weights <- pluck(.x = global_max_portfolio, "weights")
+# Check if the weights and symbols align
+tibble(weights, symbols)
+```
+
+```{r}
+# Ensure that the weights vector sums up to 1
+tibble(weights, symbols) |>
+  summarize(total_weight = sum(weights))
+```
+
+Technical Indicators (Daily)
+
+```{r}
+# Simple Moving Average 20 (SMA20)
+# Relative Strength Index 14 (RSI14)
+# Moving Average Convergence and Divergence
+
+# Extract symbols of adjusted prices
+colnames(prices) <- symbols
+
+# Rate of Change (1-day returns)
+roc1 <- ROC(prices, n = 1, type = "continuous")
+lag_roc1 <- lag.xts(roc1, k = 1) # Lagged log returns (t-1)
+target_return <- lag.xts(roc1, k = -1) # Target log future return (t+1)
+
+# SMA(5) applied to each column
+sma5 <- do.call(merge, lapply(prices, SMA, n = 5))
+colnames(sma5) <- paste0(colnames(prices), "_SMA5")
+
+# RSI(14) applied to each column
+rsi14 <- do.call(merge, lapply(prices, RSI, n = 14))
+colnames(rsi14) <- paste0(colnames(prices), "_RSI14")
+
+# MACD(Fast:12, Slow:26, Sig:9) 
+# Trend-following momentum indicator
+macd_list <- lapply(prices, function(x) MACD(x, nFast = 12, nSlow = 26, nSig = 9))
+
+macd_merge <- do.call(merge, lapply(macd_list, function(x) x[,1]))
+colnames(macd_merge) <- paste0(symbols, "_MACD")
+```
+
+```{r}
+
+```
+
+Risk Performance Features
+  Optional static features but helpful for EDA
+  
+```{r}
+# Sharpe Ratio (annualized) 
+# Measures risk-adjusted return
+sharpe_ratio <- apply(asset_returns_xts, 2, SharpeRatio.annualized)
+
+# Volatility
+# Standard deviation of monthly returns
+volatility <- apply(asset_returns_xts, 2, sd)
+
+# Mean return per asset
+mean_ret <- colMeans(asset_returns_xts)
+```
+
+Combine all technical indicators and lagged ROC into feature matrix
+```{r}
+# Prepare lagged features for feature matrix
+features_daily_xts <- merge(
+  lag_roc1, 
+  sma5, 
+  rsi14,
+  macd_merge
+)
+
+# Clean NA
+features_xts <- na.omit(features_xts)
+
+# Convert xts object to matrix x
+x <- coredata(features_xts)
+
+# Align and extract target variable y
+y <- coredata(target_return[index(features_xts)])
+
+```
+
+Combine features and target variables into Dataframe
+```{r}
+# Transform matrix into df
+feature_matrix <- as.data.frame(x)
+
+# Ensure datatype for return in target variable y is numeric
+feature_matrix$prices <- as.numeric(y)
+
+# Normalize 
+# feature_matrix <- scale(feature_matrix)
+```
 
