@@ -1,0 +1,1397 @@
+---
+title: "Toy Example"
+author: "Xin Jin"
+date: "2025-06-22"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+Let's use Yahoo Finance data as a toy example. To predict the next-month returns for multiple assets such as Apple (`AAPL`), Microsoft (`MSFT`), Google (`GOOG`), and Amazon (`AMZN`), the modeling process is conducted separately for each stock. For each asset-for example, AAPL-the target variable is defined as the return in the following month. At each time point, the feature matrix incorporates a comprehensive set of predictors, including lagged monthly returns of all four assets, relevant market indicators such as the VIX and interest rates, and technical features like rolling monthly volatility and momentum. A Super Learner ensemble model, with Generalized Linear Regression, XGBoost, and Neural Networks as its base learners, is then trained to map these features to the next-month return of the target asset. The fitted model is used to generate predictions for the asset's future monthly returns. This procedure is repeated for each asset, resulting in separate models optimized for AAPL, MSFT, GOOG, and AMZN, all utilizing the same set of predictive features.
+
+
+```{r, message=FALSE, warning=FALSE}
+library(quantmod)
+library(PerformanceAnalytics)
+library(TTR)
+library(zoo)
+library(dplyr)
+```
+
+# Asset Return Prediction Using Super Learner
+
+## Predict AMZN return
+
+The predictors include monthly log returns, 1-month lagged returns, 3-month rolling momentum (cumulative returns), and 3-month rolling volatility for four major technology stocks: AAPL, MSFT, GOOG, and AMZN. Additionally, it incorporates monthly observations of two key macroeconomic indicators: the CBOE Volatility Index (VIX) and the 10-Year U.S. Treasury yield (DGS10). The response variable represents the next month’s log return of AMZN, making the dataset suitable for modeling long-term financial return forecasting.
+
+```{r}
+# Download stock prices
+symbols <- c("AAPL", "MSFT", "GOOG", "AMZN")
+getSymbols(symbols, from = "2010-01-01", to = "2023-01-01")
+
+
+# Monthly log returns for each stock
+prices_monthly <- merge(
+  monthlyReturn(Ad(AAPL), type = "log"),
+  monthlyReturn(Ad(MSFT), type = "log"),
+  monthlyReturn(Ad(GOOG), type = "log"),
+  monthlyReturn(Ad(AMZN), type = "log")
+)
+colnames(prices_monthly) <- symbols
+
+
+# Define target: next month's AMZN return (t+1)
+target <- stats::lag(prices_monthly[, "AMZN"], k = -1)
+
+
+# Technical indicators
+lags <- stats::lag(prices_monthly, k = 1)
+mom <- rollapply(prices_monthly, width = 20, FUN = colSums, fill = NA, align = "right")
+vol <- rollapply(prices_monthly, width = 7, FUN = function(x) apply(x, 2, sd), fill = NA, align = "right")
+
+# Macroeconomic indicators
+getSymbols("VIXCLS", src = "FRED")
+getSymbols("DGS10", src = "FRED")
+vix_m <- to.monthly(VIXCLS, indexAt = "lastof", OHLC = FALSE)
+dgs10_m <- to.monthly(DGS10, indexAt = "lastof", OHLC = FALSE)
+macro <- merge(vix_m, dgs10_m)
+colnames(macro) <- c("VIX", "DGS10")
+macro <- na.locf(macro)
+macro <- merge(prices_monthly, macro, join = "left")[, c("VIX", "DGS10")]
+macro <- na.locf(macro)
+
+# Combine
+full_data <- cbind(
+  prices_monthly,
+  lags, setNames(mom, paste0(colnames(prices_monthly), "_mom")), 
+  setNames(vol, paste0(colnames(prices_monthly), "_vol")), 
+  macro,
+  AMZN_next_month_return = as.numeric(target)
+)
+full_data <- na.omit(full_data)
+
+
+# X and y for modeling
+X <- as.matrix(full_data[, setdiff(colnames(full_data), "AMZN_next_month_return")])
+y <- as.numeric(full_data[, "AMZN_next_month_return"])
+
+head(full_data)
+str(full_data)
+```
+
+
+### Base learner 1: GLM
+
+We apply Bayesian Optimization to tune the hyperparameters of a regularized generalized linear model. The objective function `cv_glmnet_bayes` evaluates the model's performance using 5-fold cross-validated mean squared error (MSE), based on a sequence of 10 lambda values centered around a proposed lambda_center. The alpha parameter controls the trade-off between Lasso and Ridge regularization. Bayesian Optimization is conducted over the joint search space of `alpha` and `lambda`, using the Upper Confidence Bound (UCB) function to efficiently identify optimal combinations. The best-performing hyperparameters are then used to fit the final model, and its predictive performance is measured by the mean squared error between predicted and observed values.
+
+```{r, message=FALSE, warning=FALSE}
+# install.packages("glmnet")
+library(glmnet)
+library(ParBayesianOptimization)
+```
+
+
+```{r}
+# Define objective function for Bayesian Optimization
+
+cv_glmnet_bayes <- function(alpha, lambda_center) {
+  lambda_center <- as.numeric(lambda_center)
+  alpha <- as.numeric(alpha)
+
+  # Create a sequence of 10 values centered around lambda_center
+  lambda_seq <- exp(seq(log(lambda_center) - 1, log(lambda_center) + 1, length.out = 10))
+
+  tryCatch({
+    cv_fit <- cv.glmnet(
+      x = X,
+      y = y,
+      alpha = alpha,
+      lambda = lambda_seq,
+      standardize = TRUE,
+      type.measure = "mse",
+      nfolds = 5
+    )
+    list(Score = -min(cv_fit$cvm))
+  }, error = function(e) {
+    message("Error: ", e$message)
+    list(Score = -1e6)
+  })
+}
+
+
+# Run Bayesian Optimization
+set.seed(123)
+opt_result <- bayesOpt(
+  FUN = cv_glmnet_bayes,
+  bounds = list(alpha = c(0, 1), lambda = c(0.001, 1)),
+  initPoints = 5,
+  iters.n = 15,
+  acq = "ucb",
+  verbose = 1
+)
+
+
+# Extract best hyperparameters
+best_alpha <- getBestPars(opt_result)$alpha
+best_lambda <- getBestPars(opt_result)$lambda
+
+# Fit final model using best parameters
+final_glm <- glmnet(X, y, alpha = best_alpha, lambda = best_lambda)
+
+# Predict using final model
+pred_glm_AMZN <- predict(final_glm, newx = X)
+
+# Evaluate
+mean((y - pred_glm_AMZN)^2)
+```
+
+
+
+### Base learner 2: XGBoost
+
+We tune an XGBoost regression model using Bayesian Optimization to identify the best-performing hyperparameters. The training data is first converted into an `xgb.DMatrix` for computational efficiency. The objective function `cv_xgb_bayes` runs 5-fold cross-validated XGBoost using a specified set of hyperparameters, including `max_depth`, `eta`, `subsample`, `colsample_bytree`, and `nrounds`. Model performance is evaluated using the root mean squared error (RMSE), and the negative mean test RMSE is used as the optimization target. 
+
+```{r, message=FALSE, warning=FALSE}
+library(xgboost)
+```
+
+
+
+```{r}
+# Set up DMatrix for efficiency
+dtrain <- xgb.DMatrix(data = X, label = y)
+
+
+# Define objective function for Bayesian Optimization
+cv_xgb_bayes <- function(max_depth, eta, subsample, colsample_bytree, nrounds) {
+  
+  # Convert parameters to appropriate types
+  max_depth <- as.integer(round(max_depth))
+  nrounds <- as.integer(round(nrounds))
+  
+  # Run cross-validated XGBoost
+  
+  cv <- xgb.cv(
+    data = dtrain,
+    nfold = 5,
+    objective = "reg:squarederror",
+    max_depth = max_depth,
+    eta = eta,
+    subsample = subsample,
+    colsample_bytree = colsample_bytree,
+    nrounds = nrounds,
+    verbose = 0,
+    early_stopping_rounds = 10,
+    eval_metric = "rmse"
+  )
+  
+  # Use negative mean RMSE for maximization
+  list(Score = -min(cv$evaluation_log$test_rmse_mean))
+}
+
+
+# Run Bayesian Optimization for XGBoost hyperparameters
+set.seed(123)
+opt_result <- bayesOpt(
+  FUN = cv_xgb_bayes,
+  bounds = list(
+    max_depth = c(2L, 6L),
+    eta = c(0.01, 0.3),
+    subsample = c(0.6, 1),
+    colsample_bytree = c(0.5, 1),
+    nrounds = c(50L, 300L)
+  ),
+  initPoints = 8,
+  iters.n = 15,
+  acq = "ucb",
+  verbose = 1
+)
+
+# Extract best parameters
+best_params <- getBestPars(opt_result)
+
+
+# Fit final XGBoost model with best hyperparameters
+final_xgb <- xgboost(
+  data = dtrain,
+  objective = "reg:squarederror",
+  max_depth = as.integer(round(best_params$max_depth)),
+  eta = best_params$eta,
+  subsample = best_params$subsample,
+  colsample_bytree = best_params$colsample_bytree,
+  nrounds = as.integer(round(best_params$nrounds)),
+  verbose = 0
+)
+
+# Predict on full data
+pred_xgb_AMZN <- predict(final_xgb, X)
+
+# Evaluate using MSE
+mse <- mean((y - pred_xgb_AMZN)^2)
+cat("XGBoost MSE:", mse, "\n")
+
+```
+
+
+### Base learner 3: Neural Networks
+
+We fit a single-layer feedforward neural network to predict asset returns, optimizing its hyperparameters using Bayesian Optimization. To ensure numerical stability during training, the predictor variables are first standardized. The objective function `cv_nn_bayes` carries out 5-fold cross-validation, training the neural network with a given number of hidden units (`size`) and a specified regularization parameter (`decay`).
+
+
+```{r, message=FALSE, warning=FALSE}
+library(nnet)
+```
+
+
+
+```{r}
+# Scale predictors for neural network 
+X_scaled <- scale(X)
+
+# Define objective function for Bayesian Optimization
+cv_nn_bayes <- function(size, decay) {
+  size <- as.integer(round(size))
+  decay <- as.numeric(decay)
+  
+  # 5-fold cross-validation
+  set.seed(123)
+  folds <- sample(rep(1:5, length.out = nrow(X_scaled)))
+  mse_folds <- numeric(5)
+  
+  for (i in 1:5) {
+    train_idx <- which(folds != i)
+    test_idx <- which(folds == i)
+    model <- tryCatch({
+      nnet(X_scaled[train_idx, ], y[train_idx],
+           size = size,
+           decay = decay,
+           linout = TRUE,
+           trace = FALSE,
+           maxit = 500)
+    }, error = function(e) NULL)
+    
+    if (!is.null(model)) {
+      preds <- predict(model, X_scaled[test_idx, ])
+      mse_folds[i] <- mean((y[test_idx] - preds)^2)
+    } else {
+      mse_folds[i] <- 1e6  # Penalize failed fit
+    }
+  }
+  
+  # Negative mean MSE (since bayesOpt maximizes)
+  list(Score = -mean(mse_folds))
+}
+
+# Run Bayesian Optimization for NN hyperparameters
+set.seed(123)
+opt_result <- bayesOpt(
+  FUN = cv_nn_bayes,
+  bounds = list(
+    size = c(2L, 10L),       # Number of hidden units
+    decay = c(0.0001, 0.1)   # Weight decay (regularization)
+  ),
+  initPoints = 6,    # > number of hyperparameters (2)
+  iters.n = 10,
+  acq = "ucb",
+  verbose = 1
+)
+
+# Extract best hyperparameters
+best_params <- getBestPars(opt_result)
+
+# Fit final neural network with best hyperparameters
+final_nn <- nnet(
+  X_scaled, y,
+  size = as.integer(round(best_params$size)),
+  decay = as.numeric(best_params$decay),
+  linout = TRUE,
+  trace = FALSE,
+  maxit = 500
+)
+
+# Predict on full data
+pred_nn_AMZN <- predict(final_nn, X_scaled)
+
+# Evaluate using MSE
+mse <- mean((y - pred_nn_AMZN)^2)
+cat("Neural Network MSE:", mse, "\n")
+
+```
+
+
+
+### Super Learner
+
+```{r}
+library(nnls)
+```
+
+
+```{r}
+# Stack base learner predictions (each column: GLM, XGB, NN)
+Z <- cbind(pred_glm_AMZN, pred_xgb_AMZN, pred_nn_AMZN)
+colnames(Z) <- c("GLM", "XGBoost", "NN")
+n <- nrow(Z)
+
+# Set up time-series cross-validation (expanding window)
+initial_window <- floor(n * 0.3)  # Use first 30% as initial train set
+horizon <- 1                      # Predict one-step-ahead each time
+test_indices <- seq(initial_window + 1, n)
+
+cv_preds <- rep(NA, n)
+cv_weights <- matrix(NA, nrow = length(test_indices), ncol = ncol(Z))
+
+for (i in seq_along(test_indices)) {
+  train_idx <- 1:(test_indices[i] - 1)
+  test_idx <- test_indices[i]
+  
+  # Fit NNLS weights on training set (expanding window)
+  nnls_fit <- nnls(Z[train_idx, ], y[train_idx])
+  w <- nnls_fit$x
+  
+  # Store weights for inspection (normalize if desired)
+  cv_weights[i, ] <- w / sum(w)
+  
+  # Predict for the current time point
+  cv_preds[test_idx] <- Z[test_idx, ] %*% w
+}
+
+# Compute MSE only for test indices (the expanding window CV period)
+ts_sl_mse <- mean((y[test_indices] - cv_preds[test_indices])^2, na.rm = TRUE)
+cat("Time Series Super Learner MSE:", ts_sl_mse, "\n")
+
+
+# Fit final NNLS on all data for production use
+final_nnls <- nnls(Z, y)
+final_weights_all <- final_nnls$x / sum(final_nnls$x)
+cat("Final Super Learner Weights (fit on all data):\n")
+print(final_weights_all)
+
+
+# Make final ensemble predictions on all data
+sl_preds_AMZN <- Z %*% final_nnls$x
+final_mse <- mean((y - sl_preds_AMZN)^2)
+cat("Super Learner MSE:", final_mse, "\n")
+
+```
+
+
+
+############################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+## Predict GOOG return
+
+The predictors include monthly log returns, 1-month lagged returns, 3-month rolling momentum (cumulative returns), and 3-month rolling volatility for four major technology stocks: AAPL, MSFT, GOOG, and AMZN. Additionally, it incorporates monthly observations of two key macroeconomic indicators: the CBOE Volatility Index (VIX) and the 10-Year U.S. Treasury yield (DGS10). The response variable represents the next month’s log return of GOOG, making the dataset suitable for modeling long-term financial return forecasting.
+
+```{r}
+# Download stock prices
+symbols <- c("AAPL", "MSFT", "GOOG", "AMZN")
+getSymbols(symbols, from = "2010-01-01", to = "2023-01-01")
+
+
+# Monthly log returns for each stock
+prices_monthly <- merge(
+  monthlyReturn(Ad(AAPL), type = "log"),
+  monthlyReturn(Ad(MSFT), type = "log"),
+  monthlyReturn(Ad(GOOG), type = "log"),
+  monthlyReturn(Ad(AMZN), type = "log")
+)
+colnames(prices_monthly) <- symbols
+
+
+# Define target: next month's GOOG return
+target <- stats::lag(prices_monthly[, "GOOG"], k = -1)
+
+
+# Technical indicators
+lags <- stats::lag(prices_monthly, k = 1)
+mom <- rollapply(prices_monthly, width = 3, FUN = colSums, fill = NA, align = "right")
+vol <- rollapply(prices_monthly, width = 3, FUN = function(x) apply(x, 2, sd), fill = NA, align = "right")
+
+# Macroeconomic indicators
+getSymbols("VIXCLS", src = "FRED")
+getSymbols("DGS10", src = "FRED")
+vix_m <- to.monthly(VIXCLS, indexAt = "lastof", OHLC = FALSE)
+dgs10_m <- to.monthly(DGS10, indexAt = "lastof", OHLC = FALSE)
+macro <- merge(vix_m, dgs10_m)
+colnames(macro) <- c("VIX", "DGS10")
+macro <- na.locf(macro)
+macro <- merge(prices_monthly, macro, join = "left")[, c("VIX", "DGS10")]
+macro <- na.locf(macro)
+
+
+# Combine
+full_data <- cbind(
+  prices_monthly,
+  lags, setNames(mom, paste0(colnames(prices_monthly), "_mom")), 
+  setNames(vol, paste0(colnames(prices_monthly), "_vol")), 
+  macro,
+  GOOG_next_month_return = as.numeric(target)
+)
+full_data <- na.omit(full_data)
+
+
+# X and y for modeling
+X <- as.matrix(full_data[, setdiff(colnames(full_data), "GOOG_next_month_return")])
+y <- as.numeric(full_data[, "GOOG_next_month_return"])
+
+head(full_data)
+str(full_data)
+```
+
+
+
+### Base learner 1: GLM
+
+```{r}
+# Define objective function for Bayesian Optimization
+
+cv_glmnet_bayes <- function(alpha, lambda_center) {
+  lambda_center <- as.numeric(lambda_center)
+  alpha <- as.numeric(alpha)
+
+  # Create a sequence of 10 values centered around lambda_center
+  lambda_seq <- exp(seq(log(lambda_center) - 1, log(lambda_center) + 1, length.out = 10))
+
+  tryCatch({
+    cv_fit <- cv.glmnet(
+      x = X,
+      y = y,
+      alpha = alpha,
+      lambda = lambda_seq,
+      standardize = TRUE,
+      type.measure = "mse",
+      nfolds = 5
+    )
+    list(Score = -min(cv_fit$cvm))
+  }, error = function(e) {
+    message("Error: ", e$message)
+    list(Score = -1e6)
+  })
+}
+
+
+# Run Bayesian Optimization
+set.seed(123)
+opt_result <- bayesOpt(
+  FUN = cv_glmnet_bayes,
+  bounds = list(alpha = c(0, 1), lambda = c(0.001, 1)),
+  initPoints = 5,
+  iters.n = 15,
+  acq = "ucb",
+  verbose = 1
+)
+
+
+# Extract best hyperparameters
+best_alpha <- getBestPars(opt_result)$alpha
+best_lambda <- getBestPars(opt_result)$lambda
+
+# Fit final model using best parameters
+final_glm <- glmnet(X, y, alpha = best_alpha, lambda = best_lambda)
+
+# Predict using final model
+pred_glm_GOOG <- predict(final_glm, newx = X)
+
+# Evaluate
+mean((y - pred_glm_GOOG)^2)
+```
+
+
+
+### Base learner 2: XGBoost
+
+```{r}
+# Set up DMatrix for efficiency
+dtrain <- xgb.DMatrix(data = X, label = y)
+
+
+# Define objective function for Bayesian Optimization
+cv_xgb_bayes <- function(max_depth, eta, subsample, colsample_bytree, nrounds) {
+  
+  # Convert parameters to appropriate types
+  max_depth <- as.integer(round(max_depth))
+  nrounds <- as.integer(round(nrounds))
+  
+  # Run cross-validated XGBoost
+  
+  cv <- xgb.cv(
+    data = dtrain,
+    nfold = 5,
+    objective = "reg:squarederror",
+    max_depth = max_depth,
+    eta = eta,
+    subsample = subsample,
+    colsample_bytree = colsample_bytree,
+    nrounds = nrounds,
+    verbose = 0,
+    early_stopping_rounds = 10,
+    eval_metric = "rmse"
+  )
+  
+  # Use negative mean RMSE for maximization
+  list(Score = -min(cv$evaluation_log$test_rmse_mean))
+}
+
+
+# Run Bayesian Optimization for XGBoost hyperparameters
+set.seed(123)
+opt_result <- bayesOpt(
+  FUN = cv_xgb_bayes,
+  bounds = list(
+    max_depth = c(2L, 6L),
+    eta = c(0.01, 0.3),
+    subsample = c(0.6, 1),
+    colsample_bytree = c(0.5, 1),
+    nrounds = c(50L, 300L)
+  ),
+  initPoints = 8,
+  iters.n = 15,
+  acq = "ucb",
+  verbose = 1
+)
+
+# Extract best parameters
+best_params <- getBestPars(opt_result)
+
+
+# Fit final XGBoost model with best hyperparameters
+final_xgb <- xgboost(
+  data = dtrain,
+  objective = "reg:squarederror",
+  max_depth = as.integer(round(best_params$max_depth)),
+  eta = best_params$eta,
+  subsample = best_params$subsample,
+  colsample_bytree = best_params$colsample_bytree,
+  nrounds = as.integer(round(best_params$nrounds)),
+  verbose = 0
+)
+
+# Predict on full data
+pred_xgb_GOOG <- predict(final_xgb, X)
+
+# Evaluate using MSE
+mse <- mean((y - pred_xgb_GOOG)^2)
+cat("XGBoost MSE:", mse, "\n")
+
+```
+
+
+
+### Base learner 3: Neural Networks
+
+```{r}
+# Scale predictors for neural network 
+X_scaled <- scale(X)
+
+# Define objective function for Bayesian Optimization
+cv_nn_bayes <- function(size, decay) {
+  size <- as.integer(round(size))
+  decay <- as.numeric(decay)
+  
+  # 5-fold cross-validation
+  set.seed(123)
+  folds <- sample(rep(1:5, length.out = nrow(X_scaled)))
+  mse_folds <- numeric(5)
+  
+  for (i in 1:5) {
+    train_idx <- which(folds != i)
+    test_idx <- which(folds == i)
+    model <- tryCatch({
+      nnet(X_scaled[train_idx, ], y[train_idx],
+           size = size,
+           decay = decay,
+           linout = TRUE,
+           trace = FALSE,
+           maxit = 500)
+    }, error = function(e) NULL)
+    
+    if (!is.null(model)) {
+      preds <- predict(model, X_scaled[test_idx, ])
+      mse_folds[i] <- mean((y[test_idx] - preds)^2)
+    } else {
+      mse_folds[i] <- 1e6  # Penalize failed fit
+    }
+  }
+  
+  # Negative mean MSE (since bayesOpt maximizes)
+  list(Score = -mean(mse_folds))
+}
+
+# Run Bayesian Optimization for NN hyperparameters
+set.seed(123)
+opt_result <- bayesOpt(
+  FUN = cv_nn_bayes,
+  bounds = list(
+    size = c(2L, 10L),       # Number of hidden units
+    decay = c(0.0001, 0.1)   # Weight decay (regularization)
+  ),
+  initPoints = 6,    # > number of hyperparameters (2)
+  iters.n = 10,
+  acq = "ucb",
+  verbose = 1
+)
+
+# Extract best hyperparameters
+best_params <- getBestPars(opt_result)
+
+# Fit final neural network with best hyperparameters
+final_nn <- nnet(
+  X_scaled, y,
+  size = as.integer(round(best_params$size)),
+  decay = as.numeric(best_params$decay),
+  linout = TRUE,
+  trace = FALSE,
+  maxit = 500
+)
+
+# Predict on full data
+pred_nn_GOOG <- predict(final_nn, X_scaled)
+
+# Evaluate using MSE
+mse <- mean((y - pred_nn_GOOG)^2)
+cat("Neural Network MSE:", mse, "\n")
+
+```
+
+
+
+### Super Learner
+
+```{r}
+# Stack base learner predictions (each column: GLM, XGB, NN)
+Z <- cbind(pred_glm_GOOG, pred_xgb_GOOG, pred_nn_GOOG)
+colnames(Z) <- c("GLM", "XGBoost", "NN")
+n <- nrow(Z)
+
+# Set up time-series cross-validation (expanding window)
+initial_window <- floor(n * 0.3)  # Use first 30% as initial train set
+horizon <- 1                      # Predict one-step-ahead each time
+test_indices <- seq(initial_window + 1, n)
+
+cv_preds <- rep(NA, n)
+cv_weights <- matrix(NA, nrow = length(test_indices), ncol = ncol(Z))
+
+for (i in seq_along(test_indices)) {
+  train_idx <- 1:(test_indices[i] - 1)
+  test_idx <- test_indices[i]
+  
+  # Fit NNLS weights on training set (expanding window)
+  nnls_fit <- nnls(Z[train_idx, ], y[train_idx])
+  w <- nnls_fit$x
+  
+  # Store weights for inspection (normalize if desired)
+  cv_weights[i, ] <- w / sum(w)
+  
+  # Predict for the current time point
+  cv_preds[test_idx] <- Z[test_idx, ] %*% w
+}
+
+# Compute MSE only for test indices (the expanding window CV period)
+ts_sl_mse <- mean((y[test_indices] - cv_preds[test_indices])^2, na.rm = TRUE)
+cat("Time Series Super Learner MSE:", ts_sl_mse, "\n")
+
+
+# Fit final NNLS on all data for production use
+final_nnls <- nnls(Z, y)
+final_weights_all <- final_nnls$x / sum(final_nnls$x)
+cat("Final Super Learner Weights (fit on all data):\n")
+print(final_weights_all)
+
+
+# Make final ensemble predictions on all data
+sl_preds_GOOG <- Z %*% final_nnls$x
+final_mse <- mean((y - sl_preds_GOOG)^2)
+cat("Super Learner MSE:", final_mse, "\n")
+
+```
+
+
+
+
+
+############################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+## Predict MSFT return
+
+The predictors include monthly log returns, 1-month lagged returns, 3-month rolling momentum (cumulative returns), and 3-month rolling volatility for four major technology stocks: AAPL, MSFT, GOOG, and AMZN. Additionally, it incorporates monthly observations of two key macroeconomic indicators: the CBOE Volatility Index (VIX) and the 10-Year U.S. Treasury yield (DGS10). The response variable represents the next month’s log return of MSFT, making the dataset suitable for modeling long-term financial return forecasting.
+
+```{r}
+# Download stock prices
+symbols <- c("AAPL", "MSFT", "GOOG", "AMZN")
+getSymbols(symbols, from = "2010-01-01", to = "2023-01-01")
+
+
+# Monthly log returns for each stock
+prices_monthly <- merge(
+  monthlyReturn(Ad(AAPL), type = "log"),
+  monthlyReturn(Ad(MSFT), type = "log"),
+  monthlyReturn(Ad(GOOG), type = "log"),
+  monthlyReturn(Ad(AMZN), type = "log")
+)
+colnames(prices_monthly) <- symbols
+
+
+# Define target: next month's MSFT return
+target <- stats::lag(prices_monthly[, "MSFT"], k = -1)
+
+
+# Technical indicators
+lags <- stats::lag(prices_monthly, k = 1)
+mom <- rollapply(prices_monthly, width = 3, FUN = colSums, fill = NA, align = "right")
+vol <- rollapply(prices_monthly, width = 3, FUN = function(x) apply(x, 2, sd), fill = NA, align = "right")
+
+# Macroeconomic indicators
+getSymbols("VIXCLS", src = "FRED")
+getSymbols("DGS10", src = "FRED")
+vix_m <- to.monthly(VIXCLS, indexAt = "lastof", OHLC = FALSE)
+dgs10_m <- to.monthly(DGS10, indexAt = "lastof", OHLC = FALSE)
+macro <- merge(vix_m, dgs10_m)
+colnames(macro) <- c("VIX", "DGS10")
+macro <- na.locf(macro)
+macro <- merge(prices_monthly, macro, join = "left")[, c("VIX", "DGS10")]
+macro <- na.locf(macro)
+
+
+# Combine
+full_data <- cbind(
+  prices_monthly,
+  lags, setNames(mom, paste0(colnames(prices_monthly), "_mom")), 
+  setNames(vol, paste0(colnames(prices_monthly), "_vol")), 
+  macro,
+  MSFT_next_month_return = as.numeric(target)
+)
+full_data <- na.omit(full_data)
+
+
+# X and y for modeling
+X <- as.matrix(full_data[, setdiff(colnames(full_data), "MSFT_next_month_return")])
+y <- as.numeric(full_data[, "MSFT_next_month_return"])
+
+head(full_data)
+str(full_data)
+```
+
+
+
+### Base learner 1: GLM
+
+```{r}
+# Define objective function for Bayesian Optimization
+
+cv_glmnet_bayes <- function(alpha, lambda_center) {
+  lambda_center <- as.numeric(lambda_center)
+  alpha <- as.numeric(alpha)
+
+  # Create a sequence of 10 values centered around lambda_center
+  lambda_seq <- exp(seq(log(lambda_center) - 1, log(lambda_center) + 1, length.out = 10))
+
+  tryCatch({
+    cv_fit <- cv.glmnet(
+      x = X,
+      y = y,
+      alpha = alpha,
+      lambda = lambda_seq,
+      standardize = TRUE,
+      type.measure = "mse",
+      nfolds = 5
+    )
+    list(Score = -min(cv_fit$cvm))
+  }, error = function(e) {
+    message("Error: ", e$message)
+    list(Score = -1e6)
+  })
+}
+
+
+# Run Bayesian Optimization
+set.seed(123)
+opt_result <- bayesOpt(
+  FUN = cv_glmnet_bayes,
+  bounds = list(alpha = c(0, 1), lambda = c(0.001, 1)),
+  initPoints = 5,
+  iters.n = 15,
+  acq = "ucb",
+  verbose = 1
+)
+
+
+# Extract best hyperparameters
+best_alpha <- getBestPars(opt_result)$alpha
+best_lambda <- getBestPars(opt_result)$lambda
+
+# Fit final model using best parameters
+final_glm <- glmnet(X, y, alpha = best_alpha, lambda = best_lambda)
+
+# Predict using final model
+pred_glm_MSFT <- predict(final_glm, newx = X)
+
+# Evaluate
+mean((y - pred_glm_MSFT)^2)
+```
+
+
+
+### Base learner 2: XGBoost
+
+```{r}
+# Set up DMatrix for efficiency
+dtrain <- xgb.DMatrix(data = X, label = y)
+
+
+# Define objective function for Bayesian Optimization
+cv_xgb_bayes <- function(max_depth, eta, subsample, colsample_bytree, nrounds) {
+  
+  # Convert parameters to appropriate types
+  max_depth <- as.integer(round(max_depth))
+  nrounds <- as.integer(round(nrounds))
+  
+  # Run cross-validated XGBoost
+  
+  cv <- xgb.cv(
+    data = dtrain,
+    nfold = 5,
+    objective = "reg:squarederror",
+    max_depth = max_depth,
+    eta = eta,
+    subsample = subsample,
+    colsample_bytree = colsample_bytree,
+    nrounds = nrounds,
+    verbose = 0,
+    early_stopping_rounds = 10,
+    eval_metric = "rmse"
+  )
+  
+  # Use negative mean RMSE for maximization
+  list(Score = -min(cv$evaluation_log$test_rmse_mean))
+}
+
+
+# Run Bayesian Optimization for XGBoost hyperparameters
+set.seed(123)
+opt_result <- bayesOpt(
+  FUN = cv_xgb_bayes,
+  bounds = list(
+    max_depth = c(2L, 6L),
+    eta = c(0.01, 0.3),
+    subsample = c(0.6, 1),
+    colsample_bytree = c(0.5, 1),
+    nrounds = c(50L, 300L)
+  ),
+  initPoints = 8,
+  iters.n = 15,
+  acq = "ucb",
+  verbose = 1
+)
+
+# Extract best parameters
+best_params <- getBestPars(opt_result)
+
+
+# Fit final XGBoost model with best hyperparameters
+final_xgb <- xgboost(
+  data = dtrain,
+  objective = "reg:squarederror",
+  max_depth = as.integer(round(best_params$max_depth)),
+  eta = best_params$eta,
+  subsample = best_params$subsample,
+  colsample_bytree = best_params$colsample_bytree,
+  nrounds = as.integer(round(best_params$nrounds)),
+  verbose = 0
+)
+
+# Predict on full data
+pred_xgb_MSFT <- predict(final_xgb, X)
+
+# Evaluate using MSE
+mse <- mean((y - pred_xgb_MSFT)^2)
+cat("XGBoost MSE:", mse, "\n")
+
+```
+
+
+
+### Base learner 3: Neural Networks
+
+```{r}
+# Scale predictors for neural network 
+X_scaled <- scale(X)
+
+# Define objective function for Bayesian Optimization
+cv_nn_bayes <- function(size, decay) {
+  size <- as.integer(round(size))
+  decay <- as.numeric(decay)
+  
+  # 5-fold cross-validation
+  set.seed(123)
+  folds <- sample(rep(1:5, length.out = nrow(X_scaled)))
+  mse_folds <- numeric(5)
+  
+  for (i in 1:5) {
+    train_idx <- which(folds != i)
+    test_idx <- which(folds == i)
+    model <- tryCatch({
+      nnet(X_scaled[train_idx, ], y[train_idx],
+           size = size,
+           decay = decay,
+           linout = TRUE,
+           trace = FALSE,
+           maxit = 500)
+    }, error = function(e) NULL)
+    
+    if (!is.null(model)) {
+      preds <- predict(model, X_scaled[test_idx, ])
+      mse_folds[i] <- mean((y[test_idx] - preds)^2)
+    } else {
+      mse_folds[i] <- 1e6  # Penalize failed fit
+    }
+  }
+  
+  # Negative mean MSE (since bayesOpt maximizes)
+  list(Score = -mean(mse_folds))
+}
+
+# Run Bayesian Optimization for NN hyperparameters
+set.seed(123)
+opt_result <- bayesOpt(
+  FUN = cv_nn_bayes,
+  bounds = list(
+    size = c(2L, 10L),       # Number of hidden units
+    decay = c(0.0001, 0.1)   # Weight decay (regularization)
+  ),
+  initPoints = 6,    # > number of hyperparameters (2)
+  iters.n = 10,
+  acq = "ucb",
+  verbose = 1
+)
+
+# Extract best hyperparameters
+best_params <- getBestPars(opt_result)
+
+# Fit final neural network with best hyperparameters
+final_nn <- nnet(
+  X_scaled, y,
+  size = as.integer(round(best_params$size)),
+  decay = as.numeric(best_params$decay),
+  linout = TRUE,
+  trace = FALSE,
+  maxit = 500
+)
+
+# Predict on full data
+pred_nn_MSFT <- predict(final_nn, X_scaled)
+
+# Evaluate using MSE
+mse <- mean((y - pred_nn_MSFT)^2)
+cat("Neural Network MSE:", mse, "\n")
+
+```
+
+
+
+### Super Learner
+
+```{r}
+# Stack base learner predictions (each column: GLM, XGB, NN)
+Z <- cbind(pred_glm_MSFT, pred_xgb_MSFT, pred_nn_MSFT)
+colnames(Z) <- c("GLM", "XGBoost", "NN")
+n <- nrow(Z)
+
+# Set up time-series cross-validation (expanding window)
+initial_window <- floor(n * 0.3)  # Use first 30% as initial train set
+horizon <- 1                      # Predict one-step-ahead each time
+test_indices <- seq(initial_window + 1, n)
+
+cv_preds <- rep(NA, n)
+cv_weights <- matrix(NA, nrow = length(test_indices), ncol = ncol(Z))
+
+for (i in seq_along(test_indices)) {
+  train_idx <- 1:(test_indices[i] - 1)
+  test_idx <- test_indices[i]
+  
+  # Fit NNLS weights on training set (expanding window)
+  nnls_fit <- nnls(Z[train_idx, ], y[train_idx])
+  w <- nnls_fit$x
+  
+  # Store weights for inspection (normalize if desired)
+  cv_weights[i, ] <- w / sum(w)
+  
+  # Predict for the current time point
+  cv_preds[test_idx] <- Z[test_idx, ] %*% w
+}
+
+# Compute MSE only for test indices (the expanding window CV period)
+ts_sl_mse <- mean((y[test_indices] - cv_preds[test_indices])^2, na.rm = TRUE)
+cat("Time Series Super Learner MSE:", ts_sl_mse, "\n")
+
+
+# Fit final NNLS on all data for production use
+final_nnls <- nnls(Z, y)
+final_weights_all <- final_nnls$x / sum(final_nnls$x)
+cat("Final Super Learner Weights (fit on all data):\n")
+print(final_weights_all)
+
+
+# Make final ensemble predictions on all data
+sl_preds_MSFT <- Z %*% final_nnls$x
+final_mse <- mean((y - sl_preds_MSFT)^2)
+cat("Super Learner MSE:", final_mse, "\n")
+
+```
+
+
+
+
+
+
+############################################################################################################################################################################################################################################################################################################################################################################################################################################################################################################
+
+
+## Predict AAPL return
+
+The predictors include monthly log returns, 1-month lagged returns, 3-month rolling momentum (cumulative returns), and 3-month rolling volatility for four major technology stocks: AAPL, MSFT, GOOG, and AMZN. Additionally, it incorporates monthly observations of two key macroeconomic indicators: the CBOE Volatility Index (VIX) and the 10-Year U.S. Treasury yield (DGS10). The response variable represents the next month’s log return of AAPL, making the dataset suitable for modeling long-term financial return forecasting.
+
+```{r}
+# Download stock prices
+symbols <- c("AAPL", "MSFT", "GOOG", "AMZN")
+getSymbols(symbols, from = "2010-01-01", to = "2023-01-01")
+
+
+# Monthly log returns for each stock
+prices_monthly <- merge(
+  monthlyReturn(Ad(AAPL), type = "log"),
+  monthlyReturn(Ad(MSFT), type = "log"),
+  monthlyReturn(Ad(GOOG), type = "log"),
+  monthlyReturn(Ad(AMZN), type = "log")
+)
+colnames(prices_monthly) <- symbols
+
+
+# Define target: next month's AAPL return
+target <- stats::lag(prices_monthly[, "AAPL"], k = -1)
+
+
+# Technical indicators
+lags <- stats::lag(prices_monthly, k = 1)
+mom <- rollapply(prices_monthly, width = 3, FUN = colSums, fill = NA, align = "right")
+vol <- rollapply(prices_monthly, width = 3, FUN = function(x) apply(x, 2, sd), fill = NA, align = "right")
+
+# Macroeconomic indicators
+getSymbols("VIXCLS", src = "FRED")
+getSymbols("DGS10", src = "FRED")
+vix_m <- to.monthly(VIXCLS, indexAt = "lastof", OHLC = FALSE)
+dgs10_m <- to.monthly(DGS10, indexAt = "lastof", OHLC = FALSE)
+macro <- merge(vix_m, dgs10_m)
+colnames(macro) <- c("VIX", "DGS10")
+macro <- na.locf(macro)
+macro <- merge(prices_monthly, macro, join = "left")[, c("VIX", "DGS10")]
+macro <- na.locf(macro)
+
+
+# Combine
+full_data <- cbind(
+  prices_monthly,
+  lags, setNames(mom, paste0(colnames(prices_monthly), "_mom")), 
+  setNames(vol, paste0(colnames(prices_monthly), "_vol")), 
+  macro,
+  AAPL_next_month_return = as.numeric(target)
+)
+full_data <- na.omit(full_data)
+
+
+# X and y for modeling
+X <- as.matrix(full_data[, setdiff(colnames(full_data), "AAPL_next_month_return")])
+y <- as.numeric(full_data[, "AAPL_next_month_return"])
+
+head(full_data)
+str(full_data)
+```
+
+
+
+### Base learner 1: GLM
+
+```{r}
+# Define objective function for Bayesian Optimization
+
+cv_glmnet_bayes <- function(alpha, lambda_center) {
+  lambda_center <- as.numeric(lambda_center)
+  alpha <- as.numeric(alpha)
+
+  # Create a sequence of 10 values centered around lambda_center
+  lambda_seq <- exp(seq(log(lambda_center) - 1, log(lambda_center) + 1, length.out = 10))
+
+  tryCatch({
+    cv_fit <- cv.glmnet(
+      x = X,
+      y = y,
+      alpha = alpha,
+      lambda = lambda_seq,
+      standardize = TRUE,
+      type.measure = "mse",
+      nfolds = 5
+    )
+    list(Score = -min(cv_fit$cvm))
+  }, error = function(e) {
+    message("Error: ", e$message)
+    list(Score = -1e6)
+  })
+}
+
+
+# Run Bayesian Optimization
+set.seed(123)
+opt_result <- bayesOpt(
+  FUN = cv_glmnet_bayes,
+  bounds = list(alpha = c(0, 1), lambda = c(0.001, 1)),
+  initPoints = 5,
+  iters.n = 15,
+  acq = "ucb",
+  verbose = 1
+)
+
+
+# Extract best hyperparameters
+best_alpha <- getBestPars(opt_result)$alpha
+best_lambda <- getBestPars(opt_result)$lambda
+
+# Fit final model using best parameters
+final_glm <- glmnet(X, y, alpha = best_alpha, lambda = best_lambda)
+
+# Predict using final model
+pred_glm_AAPL <- predict(final_glm, newx = X)
+
+# Evaluate
+mean((y - pred_glm_AAPL)^2)
+```
+
+
+
+### Base learner 2: XGBoost
+
+```{r}
+# Set up DMatrix for efficiency
+dtrain <- xgb.DMatrix(data = X, label = y)
+
+
+# Define objective function for Bayesian Optimization
+cv_xgb_bayes <- function(max_depth, eta, subsample, colsample_bytree, nrounds) {
+  
+  # Convert parameters to appropriate types
+  max_depth <- as.integer(round(max_depth))
+  nrounds <- as.integer(round(nrounds))
+  
+  # Run cross-validated XGBoost
+  
+  cv <- xgb.cv(
+    data = dtrain,
+    nfold = 5,
+    objective = "reg:squarederror",
+    max_depth = max_depth,
+    eta = eta,
+    subsample = subsample,
+    colsample_bytree = colsample_bytree,
+    nrounds = nrounds,
+    verbose = 0,
+    early_stopping_rounds = 10,
+    eval_metric = "rmse"
+  )
+  
+  # Use negative mean RMSE for maximization
+  list(Score = -min(cv$evaluation_log$test_rmse_mean))
+}
+
+
+# Run Bayesian Optimization for XGBoost hyperparameters
+set.seed(123)
+opt_result <- bayesOpt(
+  FUN = cv_xgb_bayes,
+  bounds = list(
+    max_depth = c(2L, 6L),
+    eta = c(0.01, 0.3),
+    subsample = c(0.6, 1),
+    colsample_bytree = c(0.5, 1),
+    nrounds = c(50L, 300L)
+  ),
+  initPoints = 8,
+  iters.n = 15,
+  acq = "ucb",
+  verbose = 1
+)
+
+# Extract best parameters
+best_params <- getBestPars(opt_result)
+
+
+# Fit final XGBoost model with best hyperparameters
+final_xgb <- xgboost(
+  data = dtrain,
+  objective = "reg:squarederror",
+  max_depth = as.integer(round(best_params$max_depth)),
+  eta = best_params$eta,
+  subsample = best_params$subsample,
+  colsample_bytree = best_params$colsample_bytree,
+  nrounds = as.integer(round(best_params$nrounds)),
+  verbose = 0
+)
+
+# Predict on full data
+pred_xgb_AAPL <- predict(final_xgb, X)
+
+# Evaluate using MSE
+mse <- mean((y - pred_xgb_AAPL)^2)
+cat("XGBoost MSE:", mse, "\n")
+
+```
+
+
+
+### Base learner 3: Neural Networks
+
+```{r}
+# Scale predictors for neural network 
+X_scaled <- scale(X)
+
+# Define objective function for Bayesian Optimization
+cv_nn_bayes <- function(size, decay) {
+  size <- as.integer(round(size))
+  decay <- as.numeric(decay)
+  
+  # 5-fold cross-validation
+  set.seed(123)
+  folds <- sample(rep(1:5, length.out = nrow(X_scaled)))
+  mse_folds <- numeric(5)
+  
+  for (i in 1:5) {
+    train_idx <- which(folds != i)
+    test_idx <- which(folds == i)
+    model <- tryCatch({
+      nnet(X_scaled[train_idx, ], y[train_idx],
+           size = size,
+           decay = decay,
+           linout = TRUE,
+           trace = FALSE,
+           maxit = 500)
+    }, error = function(e) NULL)
+    
+    if (!is.null(model)) {
+      preds <- predict(model, X_scaled[test_idx, ])
+      mse_folds[i] <- mean((y[test_idx] - preds)^2)
+    } else {
+      mse_folds[i] <- 1e6  # Penalize failed fit
+    }
+  }
+  
+  # Negative mean MSE (since bayesOpt maximizes)
+  list(Score = -mean(mse_folds))
+}
+
+# Run Bayesian Optimization for NN hyperparameters
+set.seed(123)
+opt_result <- bayesOpt(
+  FUN = cv_nn_bayes,
+  bounds = list(
+    size = c(2L, 10L),       # Number of hidden units
+    decay = c(0.0001, 0.1)   # Weight decay (regularization)
+  ),
+  initPoints = 6,    # > number of hyperparameters (2)
+  iters.n = 10,
+  acq = "ucb",
+  verbose = 1
+)
+
+# Extract best hyperparameters
+best_params <- getBestPars(opt_result)
+
+# Fit final neural network with best hyperparameters
+final_nn <- nnet(
+  X_scaled, y,
+  size = as.integer(round(best_params$size)),
+  decay = as.numeric(best_params$decay),
+  linout = TRUE,
+  trace = FALSE,
+  maxit = 500
+)
+
+# Predict on full data
+pred_nn_AAPL <- predict(final_nn, X_scaled)
+
+# Evaluate using MSE
+mse <- mean((y - pred_nn_AAPL)^2)
+cat("Neural Network MSE:", mse, "\n")
+
+```
+
+
+
+### Super Learner
+
+```{r}
+# Stack base learner predictions (each column: GLM, XGB, NN)
+Z <- cbind(pred_glm_AAPL, pred_xgb_AAPL, pred_nn_AAPL)
+colnames(Z) <- c("GLM", "XGBoost", "NN")
+n <- nrow(Z)
+
+# Set up time-series cross-validation (expanding window)
+initial_window <- floor(n * 0.3)  # Use first 30% as initial train set
+horizon <- 1                      # Predict one-step-ahead each time
+test_indices <- seq(initial_window + 1, n)
+
+cv_preds <- rep(NA, n)
+cv_weights <- matrix(NA, nrow = length(test_indices), ncol = ncol(Z))
+
+for (i in seq_along(test_indices)) {
+  train_idx <- 1:(test_indices[i] - 1)
+  test_idx <- test_indices[i]
+  
+  # Fit NNLS weights on training set (expanding window)
+  nnls_fit <- nnls(Z[train_idx, ], y[train_idx])
+  w <- nnls_fit$x
+  
+  # Store weights for inspection (normalize if desired)
+  cv_weights[i, ] <- w / sum(w)
+  
+  # Predict for the current time point
+  cv_preds[test_idx] <- Z[test_idx, ] %*% w
+}
+
+# Compute MSE only for test indices (the expanding window CV period)
+ts_sl_mse <- mean((y[test_indices] - cv_preds[test_indices])^2, na.rm = TRUE)
+cat("Time Series Super Learner MSE:", ts_sl_mse, "\n")
+
+
+# Fit final NNLS on all data for production use
+final_nnls <- nnls(Z, y)
+final_weights_all <- final_nnls$x / sum(final_nnls$x)
+cat("Final Super Learner Weights (fit on all data):\n")
+print(final_weights_all)
+
+
+# Make final ensemble predictions on all data
+sl_preds_AAPL <- Z %*% final_nnls$x
+final_mse <- mean((y - sl_preds_AAPL)^2)
+cat("Super Learner MSE:", final_mse, "\n")
+
+```
+
+
+
+# Portfolio Optimization
+
+
+# Performance Evaluation
+
+
+
+
+
+
