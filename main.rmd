@@ -301,6 +301,7 @@ y <- coredata(target_return[index(features_xts)])
 
 ```
 
+
 Combine features and target variables into Dataframe
 ```{r}
 # Transform matrix into df
