@@ -260,17 +260,42 @@ macd_merge <- do.call(merge, lapply(macd_list, function(x) x[,1]))
 colnames(macd_merge) <- paste0(symbols, "_MACD")
 ```
 
-```{r}
+Return DistributionalFeatures
 
+  Skewness can be used to flag assets as high or low risk depending on variance
+    Favor assets with positive skew and flag assets with negative skew as high risk assets
+    Classify return regime or signal
+  Kurtosis can indicate volatility clustering or risk of black swan events of assets
+    Detect tail risk and develop risk-aware modeling or ranking
+    Use when penalizing in Portfolio Optimization
+```{r}
+# Skewness
+# Measures the asymmetry of the return distribution.
+# Positive skew = long right tail (more large gains)
+# Negative skew = long left tail (more large losses)
+skewness_values <- apply(asset_returns_xts, 2, skewness)
+
+# Kurtosis
+# Measures the "tailedness" of the return distribution.
+# High kurtosis = more extreme values (fat tails), Low kurtosis = fewer
+kurtosis_values <- apply(asset_returns_xts, 2, kurtosis)
 ```
 
 Risk Performance Features
   Optional static features but helpful for EDA
-  
+  PerformanceAnalytics
 ```{r}
 # Sharpe Ratio (annualized) 
 # Measures risk-adjusted return
+# Higher values indicate better return per unit of total risk
 sharpe_ratio <- apply(asset_returns_xts, 2, SharpeRatio.annualized)
+
+# Sortino Ratio (annualized)
+# Measures risk-adjusted return using downside deviation only (ignores upside volatility)
+# More appropriate than Sharpe when upside volatility is not penalized (e.g., asymmetric risk preferences)
+sortino_ratio <- apply(asset_returns_xts, 2, function(x) {
+  SortinoRatio(R = x, MAR = 0, annualize = TRUE)d # MAR = Minimum acceptable risk (e.g. Risk-Free Rate such as Treasury Bonds)
+})
 
 # Volatility
 # Standard deviation of monthly returns
